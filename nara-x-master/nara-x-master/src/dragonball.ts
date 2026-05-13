@@ -2,6 +2,7 @@ import { execSync } from "child_process";
 import chalk from "chalk";
 import fs from "fs-extra";
 import path from "path";
+import os from "os";
 import {
   AccountEntry,
   getConnection,
@@ -14,6 +15,11 @@ import {
 const DRAGON_BALL_TWEET_STATUS_ID = "2053769643647799499";
 // 0.035 NARA = on-chain rent for CreatePost account allocation
 const MIN_POST_BALANCE = 0.035;
+// Waktu tunggu setelah post sebelum cek DM
+const DM_WAIT_MS = 20000;
+// Default paralel worker jika user tidak memberi input
+const DEFAULT_CONCURRENCY = 3;
+const MAX_CONCURRENCY = 10;
 
 function getDragonBallTweetUrl(twitterUsername: string): string {
   return `https://x.com/${twitterUsername}/status/${DRAGON_BALL_TWEET_STATUS_ID}`;
@@ -45,6 +51,11 @@ interface DmMessage {
   timestamp: number;
 }
 
+interface WorkerEnv {
+  HOME: string;
+  USERPROFILE: string;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -55,6 +66,7 @@ function getRandomContent(): string {
   return `${POST_CONTENTS[idx]} [${timestamp}]`;
 }
 
+// Ensure wallet file (shared across workers, idempotent)
 async function ensureWalletFile(account: AccountEntry): Promise<string> {
   const walletPath = path.resolve("data", "wallets", `wallet-${account.agentId}.json`);
   await fs.ensureDir(path.resolve("data", "wallets"));
@@ -63,9 +75,20 @@ async function ensureWalletFile(account: AccountEntry): Promise<string> {
   return walletPath;
 }
 
-async function setupAgentConfig(agentId: string, account: AccountEntry): Promise<void> {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const configDir = path.join(home, ".config", "nara");
+// Isolated HOME per worker — agentx-cli reads HOME/USERPROFILE to find .config/nara/
+// so each worker sees its own config dir, no cross-talk between parallel runs.
+async function setupWorkerHome(workerId: number): Promise<WorkerEnv> {
+  const base = path.join(os.tmpdir(), `nara-farm-w${workerId}-${process.pid}`);
+  await fs.ensureDir(path.join(base, ".config", "nara"));
+  return { HOME: base, USERPROFILE: base };
+}
+
+async function setupAgentConfig(
+  agentId: string,
+  account: AccountEntry,
+  workerEnv: WorkerEnv
+): Promise<void> {
+  const configDir = path.join(workerEnv.HOME, ".config", "nara");
   await fs.ensureDir(configDir);
   await fs.writeJson(`${configDir}/agent.json`, { agent_ids: [agentId] });
 
@@ -79,21 +102,35 @@ async function setupAgentConfig(agentId: string, account: AccountEntry): Promise
   await fs.writeJson(networkConfigPath, networkConfig);
 }
 
-async function createPost(walletPath: string, agentId: string, account: AccountEntry): Promise<number | null> {
-  await setupAgentConfig(agentId, account);
+function runCliIsolated(cmd: string, workerEnv: WorkerEnv, timeoutMs = 60000): string {
+  return execSync(cmd, {
+    encoding: "utf-8",
+    timeout: timeoutMs,
+    cwd: process.cwd(),
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, HOME: workerEnv.HOME, USERPROFILE: workerEnv.USERPROFILE },
+  });
+}
+
+async function createPost(
+  walletPath: string,
+  agentId: string,
+  account: AccountEntry,
+  workerEnv: WorkerEnv
+): Promise<number | null> {
+  await setupAgentConfig(agentId, account, workerEnv);
   const content = getRandomContent();
 
   try {
-    const result = execSync(
+    const result = runCliIsolated(
       `npx agentx-cli post "${content}" --wallet ${walletPath} --relay`,
-      { encoding: "utf-8", timeout: 60000, cwd: process.cwd() }
+      workerEnv
     );
 
-    const allOutput = result;
-    const match = allOutput.match(/Post\s*#?(\d+)/i) || allOutput.match(/post_id[:\s]*(\d+)/i);
+    const match = result.match(/Post\s*#?(\d+)/i) || result.match(/post_id[:\s]*(\d+)/i);
     if (match) return parseInt(match[1], 10);
 
-    const numMatch = allOutput.match(/(\d{4,8})/);
+    const numMatch = result.match(/(\d{4,8})/);
     if (numMatch) return parseInt(numMatch[1], 10);
 
     return null;
@@ -102,16 +139,16 @@ async function createPost(walletPath: string, agentId: string, account: AccountE
     const msg = (e.stdout || "") + (e.stderr || "") + (e.message || "");
     const m = msg.match(/Post\s*#?(\d+)/i) || msg.match(/(\d{4,})/);
     if (m) return parseInt(m[1], 10);
-    console.log(chalk.red(`    Post error: ${msg.slice(0, 100)}`));
     return null;
   }
 }
 
-async function checkDmInbox(walletPath: string): Promise<DragonBallCode[]> {
+async function checkDmInbox(walletPath: string, workerEnv: WorkerEnv): Promise<DragonBallCode[]> {
   try {
-    const result = execSync(
+    const result = runCliIsolated(
       `npx agentx-cli dm-inbox --from agentx-system --limit 10 --wallet ${walletPath} --json`,
-      { encoding: "utf-8", timeout: 30000, cwd: process.cwd() }
+      workerEnv,
+      30000
     );
 
     const messages: DmMessage[] = JSON.parse(result);
@@ -134,19 +171,19 @@ async function checkDmInbox(walletPath: string): Promise<DragonBallCode[]> {
   }
 }
 
-async function claimCode(walletPath: string, code: string, tweetUrl?: string): Promise<{ success: boolean; tx?: string; error?: string }> {
+async function claimCode(
+  walletPath: string,
+  code: string,
+  workerEnv: WorkerEnv,
+  tweetUrl?: string
+): Promise<{ success: boolean; tx?: string; error?: string }> {
   const claimCmd = tweetUrl
     ? `npx agentx-cli code claim ${code} --tweet-url ${tweetUrl} --relay --wallet ${walletPath}`
     : `npx agentx-cli code claim ${code} --relay --wallet ${walletPath}`;
   try {
-    const result = execSync(
-      claimCmd,
-      { encoding: "utf-8", timeout: 60000, cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] }
-    );
-
+    const result = runCliIsolated(claimCmd, workerEnv);
     const txMatch = result.match(/([A-Za-z0-9]{44,})/);
     if (txMatch) return { success: true, tx: txMatch[1] };
-
     return { success: true, tx: "ok" };
   } catch (err: unknown) {
     const e = err as { stderr?: string; stdout?: string; message?: string };
@@ -165,15 +202,16 @@ async function claimFirstPostCampaign(
   walletPath: string,
   agentId: string,
   postId: number,
-  account: AccountEntry
+  account: AccountEntry,
+  workerEnv: WorkerEnv
 ): Promise<{ success: boolean; error?: string }> {
-  await setupAgentConfig(agentId, account);
+  await setupAgentConfig(agentId, account, workerEnv);
   const tweetUrl = getDragonBallTweetUrl(account.twitterUsername);
 
   try {
-    execSync(
+    runCliIsolated(
       `npx agentx-cli campaign submit 0 --post-id ${postId} --tweet-url ${tweetUrl} --wallet ${walletPath} --relay`,
-      { encoding: "utf-8", timeout: 60000, cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] }
+      workerEnv
     );
     return { success: true };
   } catch (err: unknown) {
@@ -186,6 +224,165 @@ async function claimFirstPostCampaign(
   }
 }
 
+// Mutex-protected save to avoid concurrent writes clobbering accounts.json
+let saveLock: Promise<void> = Promise.resolve();
+async function safeSaveAccounts(config: Awaited<ReturnType<typeof loadAccounts>>): Promise<void> {
+  const prev = saveLock;
+  let release!: () => void;
+  saveLock = new Promise<void>((r) => (release = r));
+  try {
+    await prev;
+    await saveAccounts(config);
+  } finally {
+    release();
+  }
+}
+
+interface FarmResult {
+  name: string;
+  postCreated: boolean;
+  codesClaimed: number;
+  campaignClaimed: boolean;
+  error?: string;
+}
+
+async function processOneAccount(
+  workerId: number,
+  account: AccountEntry,
+  index: number,
+  total: number,
+  workerEnv: WorkerEnv,
+  config: Awaited<ReturnType<typeof loadAccounts>>
+): Promise<FarmResult> {
+  const result: FarmResult = {
+    name: account.name,
+    postCreated: false,
+    codesClaimed: 0,
+    campaignClaimed: false,
+  };
+
+  const tag = chalk.bold(`[W${workerId}] [${index + 1}/${total}]`);
+  const walletPath = await ensureWalletFile(account);
+
+  console.log(`${tag} ${account.name} (${account.agentId})`);
+
+  try {
+    const kp = getKeypair(account.privateKey);
+    const conn = getConnection();
+    const balance = await conn.getBalance(kp.publicKey);
+    const balanceNara = balance / 1e9;
+
+    // --- Low-balance path: skip post, cek DM aja ---
+    if (balanceNara < MIN_POST_BALANCE) {
+      console.log(
+        chalk.yellow(
+          `${tag} ⚠️  Low balance (${balanceNara.toFixed(4)} NARA) — skipping post, DM only`
+        )
+      );
+      const codes = await checkDmInbox(walletPath, workerEnv);
+      for (const db of codes) {
+        const tweetUrl = account.status.twitterBound
+          ? getDragonBallTweetUrl(account.twitterUsername)
+          : undefined;
+        const claim = await claimCode(walletPath, db.code, workerEnv, tweetUrl);
+        if (claim.success) {
+          console.log(chalk.green(`${tag} ✅ Claimed ${db.code.slice(0, 12)}`));
+          result.codesClaimed++;
+        } else if (claim.error === "already-claimed") {
+          console.log(chalk.gray(`${tag} — Already claimed ${db.code.slice(0, 12)}`));
+        } else {
+          console.log(chalk.red(`${tag} ❌ Claim failed: ${claim.error}`));
+        }
+      }
+      return result;
+    }
+
+    // --- Normal path ---
+    console.log(chalk.gray(`${tag} → Creating post...`));
+    const postId = await createPost(walletPath, account.agentId, account, workerEnv);
+    if (postId) {
+      console.log(chalk.green(`${tag} ✅ Post #${postId}`));
+      result.postCreated = true;
+    } else {
+      console.log(chalk.yellow(`${tag} ⚠️  Post failed, checking DM anyway...`));
+    }
+
+    console.log(chalk.gray(`${tag} → Waiting ${DM_WAIT_MS / 1000}s for DM...`));
+    await sleep(DM_WAIT_MS);
+
+    console.log(chalk.gray(`${tag} → Checking DM inbox...`));
+    const codes = await checkDmInbox(walletPath, workerEnv);
+
+    if (codes.length === 0) {
+      console.log(chalk.gray(`${tag} — No Dragon Ball codes found`));
+    } else {
+      console.log(chalk.cyan(`${tag} 📬 Found ${codes.length} code(s)`));
+      for (const db of codes) {
+        const tweetUrl = account.status.twitterBound
+          ? getDragonBallTweetUrl(account.twitterUsername)
+          : undefined;
+        const claim = await claimCode(walletPath, db.code, workerEnv, tweetUrl);
+        if (claim.success) {
+          console.log(chalk.green(`${tag} ✅ Claimed ${db.code.slice(0, 12)} (tx ${claim.tx?.slice(0, 10)}…)`));
+          result.codesClaimed++;
+        } else if (claim.error === "already-claimed") {
+          console.log(chalk.gray(`${tag} — Already claimed ${db.code.slice(0, 12)}`));
+        } else if (claim.error === "expired") {
+          console.log(chalk.yellow(`${tag} ⏰ Expired ${db.code.slice(0, 12)}`));
+        } else {
+          console.log(chalk.red(`${tag} ❌ ${claim.error}`));
+        }
+      }
+    }
+
+    // --- First post campaign (cuma jalan kalau akun belum done) ---
+    if (postId && !account.status.done) {
+      console.log(chalk.gray(`${tag} → Trying first post campaign...`));
+      const campaign = await claimFirstPostCampaign(
+        walletPath,
+        account.agentId,
+        postId,
+        account,
+        workerEnv
+      );
+      if (campaign.success) {
+        console.log(chalk.green(`${tag} ✅ First post campaign claimed! (+10 NARA)`));
+        account.status.done = true;
+        result.campaignClaimed = true;
+        await safeSaveAccounts(config);
+      } else if (campaign.error === "already-claimed") {
+        console.log(chalk.gray(`${tag} — Campaign already claimed`));
+        account.status.done = true;
+        result.campaignClaimed = true;
+        await safeSaveAccounts(config);
+      } else {
+        console.log(chalk.yellow(`${tag} ⚠️  Campaign: ${campaign.error}`));
+      }
+    }
+  } catch (err: unknown) {
+    const msg = (err as Error).message || "unknown";
+    console.log(chalk.red(`${tag} ❌ ${msg.slice(0, 80)}`));
+    result.error = msg;
+  }
+
+  return result;
+}
+
+async function askConcurrency(): Promise<number> {
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((resolve) => {
+    rl.question(
+      chalk.cyan(`  ⚡ Paralel berapa worker? [default: ${DEFAULT_CONCURRENCY}, max ${MAX_CONCURRENCY}]: `),
+      resolve
+    );
+  });
+  rl.close();
+  const n = parseInt(answer.trim(), 10);
+  if (!n || isNaN(n)) return DEFAULT_CONCURRENCY;
+  return Math.max(1, Math.min(MAX_CONCURRENCY, n));
+}
+
 export async function dragonBallFarm(): Promise<void> {
   const config = await loadAccounts();
   const eligible = config.accounts.filter((a) => a.status.registered);
@@ -195,113 +392,62 @@ export async function dragonBallFarm(): Promise<void> {
     return;
   }
 
-  console.log(chalk.bold(`\n🔮 Dragon Ball Farm — ${eligible.length} accounts\n`));
+  const concurrency = Math.min(await askConcurrency(), eligible.length);
 
-  let totalClaimed = 0;
-  let totalPosts = 0;
+  console.log(
+    chalk.bold(`\n🔮 Dragon Ball Farm — ${eligible.length} accounts, ${concurrency} parallel workers\n`)
+  );
 
-  for (let i = 0; i < eligible.length; i++) {
-    const account = eligible[i];
-    const walletPath = await ensureWalletFile(account);
+  // Pre-create isolated HOME dir per worker
+  const workerEnvs: WorkerEnv[] = [];
+  for (let w = 0; w < concurrency; w++) {
+    workerEnvs.push(await setupWorkerHome(w));
+  }
 
-    console.log(
-      chalk.bold(`  [${i + 1}/${eligible.length}] ${account.name} (${account.agentId})`)
-    );
+  const queue = eligible.map((account, idx) => ({ account, idx }));
+  const total = eligible.length;
+  const results: FarmResult[] = [];
+  let nextIndex = 0;
 
-    const kp = getKeypair(account.privateKey);
-    const conn = getConnection();
-    const balance = await conn.getBalance(kp.publicKey);
-    const balanceNara = balance / 1e9;
-    if (balanceNara < MIN_POST_BALANCE) {
-      console.log(chalk.yellow(`    ⚠️ Low balance (${balanceNara.toFixed(4)} NARA) — skipping post, checking DM only`));
-      const codes = await checkDmInbox(walletPath);
-      if (codes.length > 0) {
-        console.log(chalk.cyan(`    📬 Found ${codes.length} code(s)`));
-        for (const db of codes) {
-          console.log(chalk.gray(`    → Claiming ${db.code.slice(0, 12)}...`));
-          const tweetUrl = account.status.twitterBound
-            ? getDragonBallTweetUrl(account.twitterUsername)
-            : undefined;
-          const result = await claimCode(walletPath, db.code, tweetUrl);
-          if (result.success) {
-            console.log(chalk.green(`    ✅ Claimed! tx: ${result.tx?.slice(0, 20)}...`));
-            totalClaimed++;
-          } else if (result.error === "already-claimed") {
-            console.log(chalk.gray("    — Already claimed"));
-          } else {
-            console.log(chalk.red(`    ❌ ${result.error}`));
-          }
-        }
-      }
-      if (i < eligible.length - 1) await sleep(3000);
-      continue;
-    }
-
-    console.log(chalk.gray("    → Creating post..."));
-    const postId = await createPost(walletPath, account.agentId, account);
-    if (postId) {
-      console.log(chalk.green(`    ✅ Post #${postId}`));
-      totalPosts++;
-    } else {
-      console.log(chalk.yellow("    ⚠️ Post failed, checking DM anyway..."));
-    }
-
-    console.log(chalk.gray("    → Waiting 10s for DM..."));
-    await sleep(10000);
-
-    console.log(chalk.gray("    → Checking DM inbox..."));
-    const codes = await checkDmInbox(walletPath);
-
-    if (codes.length === 0) {
-      console.log(chalk.gray("    — No Dragon Ball codes found"));
-    } else {
-      console.log(chalk.cyan(`    📬 Found ${codes.length} code(s)`));
-
-      for (const db of codes) {
-        console.log(chalk.gray(`    → Claiming ${db.code.slice(0, 12)}...`));
-        const tweetUrl = account.status.twitterBound
-          ? getDragonBallTweetUrl(account.twitterUsername)
-          : undefined;
-        const result = await claimCode(walletPath, db.code, tweetUrl);
-        if (result.success) {
-          console.log(chalk.green(`    ✅ Claimed! tx: ${result.tx?.slice(0, 20)}...`));
-          totalClaimed++;
-        } else if (result.error === "already-claimed") {
-          console.log(chalk.gray("    — Already claimed"));
-        } else if (result.error === "expired") {
-          console.log(chalk.yellow("    ⏰ Expired"));
-        } else {
-          console.log(chalk.red(`    ❌ ${result.error}`));
-        }
-      }
-    }
-
-    if (postId && !account.status.done) {
-      console.log(chalk.gray("    → Trying first post campaign..."));
-      const campaign = await claimFirstPostCampaign(walletPath, account.agentId, postId, account);
-      if (campaign.success) {
-        console.log(chalk.green("    ✅ First post campaign claimed! (+10 NARA)"));
-        account.status.done = true;
-        await saveAccounts(config);
-      } else if (campaign.error === "already-claimed") {
-        console.log(chalk.gray("    — Campaign already claimed"));
-        account.status.done = true;
-        await saveAccounts(config);
-      } else {
-        console.log(chalk.yellow(`    ⚠️ Campaign: ${campaign.error}`));
-      }
-    }
-
-    if (i < eligible.length - 1) {
-      console.log(chalk.gray("    ⏳ 5s delay..."));
-      await sleep(5000);
+  async function worker(workerId: number): Promise<void> {
+    while (true) {
+      const item = queue.shift();
+      if (!item) return;
+      const displayIdx = nextIndex++;
+      const res = await processOneAccount(
+        workerId,
+        item.account,
+        displayIdx,
+        total,
+        workerEnvs[workerId],
+        config
+      );
+      results.push(res);
+      // Small delay between tasks in same worker
+      if (queue.length > 0) await sleep(1500);
     }
   }
+
+  await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
+
+  // Cleanup temp worker dirs (best effort)
+  for (const env of workerEnvs) {
+    try { await fs.remove(env.HOME); } catch {}
+  }
+
+  const totalPosts = results.filter((r) => r.postCreated).length;
+  const totalClaimed = results.reduce((s, r) => s + r.codesClaimed, 0);
+  const totalErrors = results.filter((r) => r.error).length;
 
   console.log(chalk.bold("\n═══════════════════════════════════════════"));
   console.log(chalk.bold("        🔮 DRAGON BALL FARM RESULTS"));
   console.log(chalk.bold("═══════════════════════════════════════════"));
-  console.log(chalk.cyan(`  Posts created: ${totalPosts}`));
+  console.log(chalk.cyan(`  Workers:              ${concurrency}`));
+  console.log(chalk.cyan(`  Posts created:        ${totalPosts}`));
   console.log(chalk.green(`  Dragon Balls claimed: ${totalClaimed}`));
-  console.log(chalk.gray(`  Accounts processed: ${eligible.length}\n`));
+  console.log(chalk.gray(`  Accounts processed:   ${results.length}`));
+  if (totalErrors > 0) {
+    console.log(chalk.red(`  Errors:               ${totalErrors}`));
+  }
+  console.log();
 }
