@@ -1,0 +1,37 @@
+{
+  "name": "nara-x",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "register": "tsx src/index.ts register",
+    "tweet-templates": "tsx src/index.ts tweet-templates",
+    "bind-twitter": "tsx src/index.ts bind-twitter",
+    "submit-tweet": "tsx src/index.ts submit-tweet",
+    "status": "tsx src/index.ts status",
+    "run-all": "tsx src/index.ts run-all"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Nara.build batch automation - register agents, bind twitter, earn NARA",
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "agentx-cli": "^0.2.8",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.4.2",
+    "fs-extra": "^11.3.5",
+    "inquirer": "^13.4.3",
+    "nara-sdk": "^1.0.90",
+    "naracli": "^1.0.97",
+    "ora": "^9.4.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/inquirer": "^9.0.9",
+    "@types/node": "^25.7.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
