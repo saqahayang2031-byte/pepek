@@ -198,32 +198,6 @@ async function claimCode(
   }
 }
 
-// Install skill ke agent (prereq untuk campaign claim).
-// Idempotent: kalau udah ter-install, CLI biasanya return "already" — kita treat sebagai success.
-async function installCampaignSkill(
-  walletPath: string,
-  agentId: string,
-  account: AccountEntry,
-  workerEnv: WorkerEnv,
-  skillName = "agentx-first-post-campaign"
-): Promise<{ success: boolean; alreadyInstalled: boolean; error?: string }> {
-  await setupAgentConfig(agentId, account, workerEnv);
-  try {
-    runCliIsolated(
-      `npx naracli skills add ${skillName} --wallet ${walletPath}`,
-      workerEnv
-    );
-    return { success: true, alreadyInstalled: false };
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; stdout?: string; message?: string };
-    const msg = ((e.stdout || "") + (e.stderr || "") + (e.message || "")).toLowerCase();
-    if (msg.includes("already")) {
-      return { success: true, alreadyInstalled: true };
-    }
-    return { success: false, alreadyInstalled: false, error: msg.slice(0, 120) };
-  }
-}
-
 async function claimFirstPostCampaign(
   walletPath: string,
   agentId: string,
@@ -363,18 +337,7 @@ async function processOneAccount(
 
     // --- First post campaign (cuma jalan kalau akun belum done) ---
     if (postId && !account.status.done) {
-      // Step A: pastikan skill agentx-first-post-campaign ter-install
-      console.log(chalk.gray(`${tag} → Installing campaign skill...`));
-      const skill = await installCampaignSkill(walletPath, account.agentId, account, workerEnv);
-      if (!skill.success) {
-        console.log(chalk.yellow(`${tag} ⚠️  Skill install failed: ${skill.error}`));
-      } else if (skill.alreadyInstalled) {
-        console.log(chalk.gray(`${tag} — Skill already installed`));
-      } else {
-        console.log(chalk.green(`${tag} ✅ Skill installed`));
-      }
-
-      // Step B: ambil saldo sebelum claim biar bisa verify delta
+      // Step A: ambil saldo sebelum claim biar bisa verify delta
       const balBefore = await conn.getBalance(kp.publicKey);
 
       console.log(chalk.gray(`${tag} → Submitting campaign...`));
