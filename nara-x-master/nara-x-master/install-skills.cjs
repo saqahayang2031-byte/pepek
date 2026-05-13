@@ -11,6 +11,7 @@
  *   node install-skills.cjs --file=data/accounts.json # custom source
  *   node install-skills.cjs --concurrency=5           # paralel (default 3)
  *   node install-skills.cjs --name=auto-1             # hanya 1 akun tertentu
+ *   node install-skills.cjs --name=auto-1 --verbose   # tampilkan command + stdout/stderr lengkap
  *
  * Butuh data/accounts.json + npx naracli terinstall.
  */
@@ -93,26 +94,37 @@ function runCliIsolated(cmd, workerEnv, timeoutMs = 60000) {
   });
 }
 
-async function installSkill(account, skillName, workerId, workerEnv) {
+async function installSkill(account, skillName, workerId, workerEnv, verbose) {
   const walletPath = ensureWalletFile(account);
   setupAgentConfig(account.agentId, account, workerEnv);
 
   const tag = color(`[W${workerId}] ${account.name}`, c.bold);
+  const cmd = `npx naracli skills add ${skillName} --wallet ${walletPath}`;
+
+  if (verbose) {
+    console.log(color(`  → ${tag}: running: ${cmd}`, c.gray));
+  }
 
   try {
-    const out = runCliIsolated(
-      `npx naracli skills add ${skillName} --wallet ${walletPath}`,
-      workerEnv
-    );
+    const out = runCliIsolated(cmd, workerEnv);
     console.log(color(`  ✅ ${tag}: ${skillName} installed`, c.green));
+    if (verbose && out) console.log(color(`     stdout: ${out.trim().slice(0, 500)}`, c.gray));
     return { ok: true };
   } catch (err) {
-    const msg = (err.stdout || "") + (err.stderr || "") + (err.message || "");
+    const stdout = err.stdout || "";
+    const stderr = err.stderr || "";
+    const msg = stdout + stderr + (err.message || "");
     if (msg.toLowerCase().includes("already")) {
       console.log(color(`  — ${tag}: already installed`, c.gray));
       return { ok: true, already: true };
     }
-    console.log(color(`  ❌ ${tag}: ${msg.slice(0, 100).replace(/\s+/g, " ")}`, c.red));
+    // Log full error so user bisa liat masalahnya
+    console.log(color(`  ❌ ${tag}: FAILED`, c.red));
+    if (stdout.trim()) console.log(color(`     stdout: ${stdout.trim()}`, c.gray));
+    if (stderr.trim()) console.log(color(`     stderr: ${stderr.trim()}`, c.gray));
+    if (err.message && !stdout && !stderr) {
+      console.log(color(`     message: ${err.message}`, c.gray));
+    }
     return { ok: false, error: msg };
   }
 }
@@ -127,6 +139,8 @@ async function main() {
     Math.max(1, kv.concurrency ? parseInt(kv.concurrency, 10) : DEFAULT_CONCURRENCY)
   );
   const filterName = kv.name || null;
+  const { flags } = parseArgs(process.argv);
+  const verbose = flags.has("verbose") || flags.has("v");
 
   if (!fs.existsSync(sourceFile)) {
     console.log(color(`❌ File ga ada: ${sourceFile}`, c.red));
@@ -160,7 +174,7 @@ async function main() {
     while (true) {
       const account = queue.shift();
       if (!account) return;
-      const r = await installSkill(account, skillName, wid, workerEnvs[wid]);
+      const r = await installSkill(account, skillName, wid, workerEnvs[wid], verbose);
       results.push({ name: account.name, ...r });
       await new Promise((r) => setTimeout(r, 500));
     }
