@@ -1,11 +1,18 @@
 /**
- * Standalone script: transfer NARA dari funding wallet ke semua sub-wallet.
+ * Standalone script: transfer NARA dari funding wallet ke sub-wallet yang
+ * saldonya di bawah threshold tertentu.
  *
  * Usage:
- *   node fund.js                    # interaktif, tanya amount & concurrency
- *   node fund.js 0.2                # 0.2 NARA per wallet, default 5 paralel
- *   node fund.js 0.2 10             # 0.2 NARA per wallet, 10 paralel
- *   node fund.js 0.2 10 --no-skip   # jangan skip wallet yang saldo sudah cukup
+ *   node fund.js                          # interaktif
+ *   node fund.js 0.2                      # amount 0.2, threshold default 0.5, paralel 5
+ *   node fund.js 0.2 0.5                  # amount 0.2, threshold 0.5, paralel 5
+ *   node fund.js 0.2 0.5 10               # amount 0.2, threshold 0.5, paralel 10
+ *   node fund.js 0.2 0 10                 # threshold 0 -> fund semua (ga ada yang di-skip)
+ *
+ * Arti parameter:
+ *   amount    = berapa NARA yang dikirim ke tiap wallet target
+ *   threshold = fund hanya wallet yang saldonya < threshold NARA
+ *               (set 0 kalau mau fund semua wallet tanpa skip)
  *
  * Butuh .env di direktori kerja dengan:
  *   FUNDING_PRIVATE_KEY=<base58 private key>
@@ -27,6 +34,7 @@ const bs58 = require("bs58");
 const NARA_DECIMALS = 9;
 const FUNDER_MIN_RESERVE_NARA = 0.01; // disisakan di funder untuk fee
 const DEFAULT_AMOUNT_NARA = 0.2;
+const DEFAULT_THRESHOLD_NARA = 0.5;
 const DEFAULT_CONCURRENCY = 5;
 const MAX_CONCURRENCY = 20;
 const ACCOUNTS_FILE = path.resolve(process.cwd(), "data", "accounts.json");
@@ -81,7 +89,7 @@ function parseArgs(argv) {
 }
 
 async function main() {
-  const { positional, flags } = parseArgs(process.argv);
+  const { positional } = parseArgs(process.argv);
 
   const rpcUrl = process.env.RPC_URL || "https://mainnet-api.nara.build/";
   const fundingPk = process.env.FUNDING_PRIVATE_KEY;
@@ -112,12 +120,14 @@ async function main() {
     process.exit(0);
   }
 
-  // --- Input amount ---
+  // --- Input amount (berapa NARA yang dikirim per wallet) ---
   let amount;
   if (positional[0]) {
     amount = parseFloat(positional[0]);
   } else {
-    const ans = await ask(color(`💰 Amount per wallet (NARA) [default: ${DEFAULT_AMOUNT_NARA}]: `, c.cyan));
+    const ans = await ask(
+      color(`💰 Amount per wallet (NARA) [default: ${DEFAULT_AMOUNT_NARA}]: `, c.cyan),
+    );
     amount = ans ? parseFloat(ans) : DEFAULT_AMOUNT_NARA;
   }
   if (!amount || amount <= 0 || isNaN(amount)) {
@@ -126,32 +136,48 @@ async function main() {
   }
   const amountLamports = Math.floor(amount * 10 ** NARA_DECIMALS);
 
+  // --- Input threshold (fund hanya wallet yang saldo < threshold) ---
+  let threshold;
+  if (positional[1] !== undefined) {
+    threshold = parseFloat(positional[1]);
+  } else {
+    const ans = await ask(
+      color(
+        `🎯 Fund hanya wallet dengan saldo < ? NARA [default: ${DEFAULT_THRESHOLD_NARA}, 0 = fund semua]: `,
+        c.cyan,
+      ),
+    );
+    threshold = ans === "" ? DEFAULT_THRESHOLD_NARA : parseFloat(ans);
+  }
+  if (isNaN(threshold) || threshold < 0) {
+    console.log(color("❌ Threshold invalid", c.red));
+    process.exit(1);
+  }
+  const thresholdLamports = Math.floor(threshold * 10 ** NARA_DECIMALS);
+
   // --- Input concurrency ---
   let concurrency;
-  if (positional[1]) {
-    concurrency = parseInt(positional[1], 10);
+  if (positional[2]) {
+    concurrency = parseInt(positional[2], 10);
   } else if (positional[0]) {
     concurrency = DEFAULT_CONCURRENCY;
   } else {
-    const ans = await ask(color(`⚡ Paralel berapa tx per batch? [default: ${DEFAULT_CONCURRENCY}]: `, c.cyan));
+    const ans = await ask(
+      color(`⚡ Paralel berapa tx per batch? [default: ${DEFAULT_CONCURRENCY}]: `, c.cyan),
+    );
     concurrency = ans ? parseInt(ans, 10) : DEFAULT_CONCURRENCY;
   }
   if (!concurrency || concurrency < 1 || isNaN(concurrency)) concurrency = 1;
   if (concurrency > MAX_CONCURRENCY) concurrency = MAX_CONCURRENCY;
 
-  // --- Skip flag ---
-  let skipFunded = !flags.has("--no-skip");
-  if (!positional[0] && !flags.has("--no-skip")) {
-    const ans = await ask(color("🔁 Skip wallet yang saldo >= amount? (Y/n): ", c.cyan));
-    skipFunded = ans.toLowerCase() !== "n";
-  }
-
   // --- Setup connection ---
   const connection = new Connection(rpcUrl, "confirmed");
 
+  const thresholdLabel =
+    threshold === 0 ? "fund semua (no threshold)" : `saldo < ${threshold} NARA`;
   console.log(
     color(
-      `\n💸 Funding sub-wallets — ${amount} NARA each, ${concurrency} parallel tx/batch\n`,
+      `\n💸 Funding sub-wallets — ${amount} NARA each, target: ${thresholdLabel}, ${concurrency} parallel tx/batch\n`,
       c.bold,
     ),
   );
@@ -169,11 +195,12 @@ async function main() {
     }
   }
 
-  // --- Filter target ---
+  // --- Filter target: hanya wallet yang saldo < threshold ---
+  // Kalau threshold == 0, semua wallet di-fund (tidak ada yang di-skip).
   const targets = [];
   let skipped = 0;
   for (let i = 0; i < pubkeys.length; i++) {
-    if (skipFunded && balances[i] >= amountLamports) {
+    if (threshold > 0 && balances[i] >= thresholdLamports) {
       skipped++;
       continue;
     }
@@ -181,7 +208,12 @@ async function main() {
   }
 
   if (targets.length === 0) {
-    console.log(color(`  Nothing to fund. ${skipped} wallet sudah punya >= ${amount} NARA.\n`, c.gray));
+    console.log(
+      color(
+        `  Nothing to fund. ${skipped} wallet sudah punya saldo >= ${threshold} NARA.\n`,
+        c.gray,
+      ),
+    );
     return;
   }
 
@@ -192,7 +224,9 @@ async function main() {
 
   console.log(color(`  Funder:       ${funder.publicKey.toBase58()}`, c.gray));
   console.log(color(`  Funder bal:   ${funderNara.toFixed(4)} NARA`, c.gray));
-  console.log(color(`  Targets:      ${targets.length} wallet (skip ${skipped})`, c.gray));
+  console.log(
+    color(`  Targets:      ${targets.length} wallet (skip ${skipped} yang saldo cukup)`, c.gray),
+  );
   console.log(color(`  Total needed: ${totalNeeded.toFixed(4)} NARA (+ fees)\n`, c.gray));
 
   if (funderNara < totalNeeded + FUNDER_MIN_RESERVE_NARA) {
@@ -217,6 +251,7 @@ async function main() {
     const sends = chunk.map(async (idx) => {
       const account = accounts[idx];
       const targetPk = pubkeys[idx];
+      const currentBal = balances[idx] / 10 ** NARA_DECIMALS;
 
       try {
         const tx = new Transaction().add(
@@ -233,7 +268,7 @@ async function main() {
         const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
         console.log(
           color(
-            `  ✅ ${(account.name || "-").padEnd(14)} ${targetPk.toBase58().slice(0, 8)}…  ${amount} NARA  (${sig.slice(0, 10)}…)`,
+            `  ✅ ${(account.name || "-").padEnd(14)} ${targetPk.toBase58().slice(0, 8)}…  bal=${currentBal.toFixed(4)} +${amount} NARA  (${sig.slice(0, 10)}…)`,
             c.green,
           ),
         );
@@ -256,7 +291,7 @@ async function main() {
 
   console.log(
     color(
-      `\n📊 Sent ${totalSent.toFixed(4)} NARA — ${successCount} ok, ${failCount} failed, ${skipped} skipped`,
+      `\n📊 Sent ${totalSent.toFixed(4)} NARA — ${successCount} ok, ${failCount} failed, ${skipped} skipped\n`,
       c.bold,
     ),
   );
@@ -264,7 +299,10 @@ async function main() {
   await new Promise((r) => setTimeout(r, 3000));
   const finalBal = await connection.getBalance(funder.publicKey);
   console.log(
-    color(`  Funding wallet balance: ${(finalBal / 10 ** NARA_DECIMALS).toFixed(4)} NARA\n`, c.cyan),
+    color(
+      `  Funding wallet balance: ${(finalBal / 10 ** NARA_DECIMALS).toFixed(4)} NARA\n`,
+      c.cyan,
+    ),
   );
 }
 
