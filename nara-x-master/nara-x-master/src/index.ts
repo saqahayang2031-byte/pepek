@@ -5,6 +5,7 @@ import { dragonBallFarm } from "./dragonball.js";
 import { autoRun } from "./auto.js";
 import { checkAllInbox } from "./inbox.js";
 import { sweepAll } from "./sweep.js";
+import { fundAll } from "./fund.js";
 import { batchRegisterAgents } from "./register.js";
 import { generateTweetTemplates, batchBindTwitter, batchSubmitTweet } from "./twitter.js";
 import { addAccount, generateWallet, importFromFile } from "./accounts.js";
@@ -16,6 +17,7 @@ const COMMANDS: Record<string, () => Promise<void>> = {
   farm: dragonBallFarm,
   inbox: checkAllInbox,
   sweep: sweepAll,
+  fund: () => fundAll(process.argv[3], process.argv[4]),
   balances: batchCheckBalances,
   register: batchRegisterAgents,
   "tweet-templates": generateTweetTemplates,
@@ -124,12 +126,13 @@ async function interactiveMenu(): Promise<void> {
   console.log(`  ${chalk.green("4")}  💸 Sweep ${chalk.gray("— kirim semua NARA ke main wallet")}`);
   console.log(`  ${chalk.green("5")}  💰 Balances ${chalk.gray("— cek saldo semua wallet")}`);
   console.log(`  ${chalk.green("6")}  📊 Status ${chalk.gray("— lihat status semua akun")}`);
+  console.log(`  ${chalk.green("7")}  🏦 Fund ${chalk.gray("— transfer NARA dari funding ke semua sub-wallet")}`);
   console.log();
   console.log(chalk.gray(`  ${line}`));
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise<string>((resolve) => {
-    rl.question(chalk.cyan("\n  ▶ Pilih (1-6): "), resolve);
+    rl.question(chalk.cyan("\n  ▶ Pilih (1-7): "), resolve);
   });
   rl.close();
 
@@ -142,6 +145,7 @@ async function interactiveMenu(): Promise<void> {
     case "4": await sweepAll(); break;
     case "5": await batchCheckBalances(); break;
     case "6": await showStatus(); break;
+    case "7": await fundAll(); break;
     default: console.log(chalk.red("  ❌ Pilihan gak valid"));
   }
 }
